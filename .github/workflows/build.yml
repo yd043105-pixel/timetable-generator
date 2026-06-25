@@ -1,0 +1,48 @@
+name: Build Windows EXE
+
+# 태그(v1.0.0 형식)를 푸시하면 자동으로 EXE를 빌드해 Release에 첨부합니다.
+# 수동 실행(Actions 탭의 Run workflow)도 가능합니다.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 소스 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 파이썬 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 라이브러리 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: EXE 빌드
+        run: >
+          pyinstaller --onefile --windowed --name TimetableGenerator
+          --collect-all ortools --collect-all openpyxl
+          --add-data "template.xlsx;." gui_qt.py
+
+      - name: 빌드 결과 업로드(아티팩트)
+        uses: actions/upload-artifact@v4
+        with:
+          name: TimetableGenerator-windows
+          path: dist/TimetableGenerator.exe
+
+      - name: Release 에 EXE 첨부 (태그 푸시 시)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/TimetableGenerator.exe
