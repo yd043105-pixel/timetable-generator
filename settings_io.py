@@ -21,7 +21,7 @@ def _write_header(ws, cols):
 
 
 def save_settings_xlsx(path, non_class, unavail, similar,
-                       year, semester, params):
+                       year, semester, params, roles=None):
     wb = openpyxl.Workbook()
 
     ws1 = wb.active
@@ -34,10 +34,11 @@ def save_settings_xlsx(path, non_class, unavail, similar,
     ws1.column_dimensions["C"].width = 8
 
     ws2 = wb.create_sheet("교사불가시간")
-    _write_header(ws2, ["교사", "요일", "교시"])
+    _write_header(ws2, ["교사", "요일", "교시", "학년(0=전체)"])
     for s in unavail:
-        ws2.append([s.teacher, s.day, s.period])
+        ws2.append([s.teacher, s.day, s.period, getattr(s, "grade", 0) or 0])
     ws2.column_dimensions["A"].width = 14
+    ws2.column_dimensions["D"].width = 12
 
     ws3 = wb.create_sheet("유사과목그룹")
     _write_header(ws3, ["그룹명", "과목들(쉼표로 구분)"])
@@ -45,6 +46,13 @@ def save_settings_xlsx(path, non_class, unavail, similar,
         ws3.append([g.name, ", ".join(g.subjects)])
     ws3.column_dimensions["A"].width = 16
     ws3.column_dimensions["B"].width = 50
+
+    ws_role = wb.create_sheet("역할")
+    _write_header(ws_role, ["교사", "역할"])
+    for t, r in (roles or []):
+        ws_role.append([t, r])
+    ws_role.column_dimensions["A"].width = 14
+    ws_role.column_dimensions["B"].width = 12
 
     ws4 = wb.create_sheet("기본설정")
     _write_header(ws4, ["항목", "값"])
@@ -89,9 +97,13 @@ def load_settings_xlsx(path):
             if row is None or _cell(row[0]) == "":
                 continue
             try:
+                grade = 0
+                if len(row) > 3 and _cell(row[3]) != "":
+                    grade = int(row[3])
                 unavail.append(TeacherUnavailable(teacher=str(row[0]).strip(),
                                                   day=str(row[1]).strip(),
-                                                  period=int(row[2])))
+                                                  period=int(row[2]),
+                                                  grade=grade))
             except (ValueError, TypeError, IndexError):
                 continue
 
@@ -126,9 +138,19 @@ def load_settings_xlsx(path):
             "lunch_period": _int("점심_직전교시", 4),
         }
 
+    roles = []
+    if "역할" in wb.sheetnames:
+        for row in wb["역할"].iter_rows(min_row=2, values_only=True):
+            if row is None or _cell(row[0]) == "":
+                continue
+            t = str(row[0]).strip(); r = str(_cell(row[1])).strip()
+            if t and r in ("교무부장", "학년부장", "홍보담당"):
+                roles.append((t, r))
+
     return {
         "non_class": non_class,
         "unavail": unavail,
         "similar": similar,
         "settings": settings,
+        "roles": roles,
     }

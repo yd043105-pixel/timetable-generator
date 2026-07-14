@@ -49,10 +49,11 @@ class NonClassSlot:
 
 @dataclass
 class TeacherUnavailable:
-    """교사 불가 시간"""
+    """교사 불가 시간. grade=0이면 전체 학년, 1/2/3이면 그 학년 수업만 불가."""
     teacher: str
     day: str
     period: int
+    grade: int = 0
     reason: str = ""
 
 

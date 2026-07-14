@@ -119,7 +119,7 @@ class State:
         for (cid, tch, subj) in unit.cells:
             g = self.sch.class_grade[cid]
             if (g, d, p) in self.sch.nonclass_set: delta += PEN_NONCLASS
-            if (d, p) in self.sch.unavail_set.get(tch, _EMPTY): delta += PEN_UNAVAIL
+            if self.sch._unavail_blocked(tch, g, d, p): delta += PEN_UNAVAIL
             if self.class_slot[(cid, d, p)] >= 1: delta += PEN_CLASS_CONFLICT
             self.class_slot[(cid, d, p)] += 1
             if self.teacher_slot[(tch, d, p)] >= 1: delta += PEN_TEACHER_CONFLICT
@@ -150,7 +150,7 @@ class State:
         for (cid, tch, subj) in unit.cells:
             g = self.sch.class_grade[cid]
             if (g, d, p) in self.sch.nonclass_set: delta -= PEN_NONCLASS
-            if (d, p) in self.sch.unavail_set.get(tch, _EMPTY): delta -= PEN_UNAVAIL
+            if self.sch._unavail_blocked(tch, g, d, p): delta -= PEN_UNAVAIL
             c = self.class_slot[(cid, d, p)]
             if c >= 2: delta -= PEN_CLASS_CONFLICT
             if c == 1: del self.class_slot[(cid, d, p)]
@@ -224,6 +224,190 @@ class State:
         delta = self._place(uid, d, p); self._unplace(uid)
         return delta
 
+    # ───────── 시간표 편집기 지원 ─────────
+    def cell_units(self):
+        """점유맵: (cid,d,p)->[uid], (tch,d,p)->[uid]."""
+        occ_c = defaultdict(list); occ_t = defaultdict(list)
+        for uid, dp in enumerate(self.pos):
+            if dp is None:
+                continue
+            d, p = dp
+            for (cid, tch, subj) in self.sch.units[uid].cells:
+                occ_c[(cid, d, p)].append(uid)
+                occ_t[(tch, d, p)].append(uid)
+        return occ_c, occ_t
+
+    def conflict_class_cells(self):
+        """빨강 표시할 (cid,d,p) — 한 학급 한 교시에 수업 2개 이상."""
+        occ_c, _ = self.cell_units()
+        return {k for k, uids in occ_c.items() if len(uids) > 1}
+
+    def conflict_teacher_cells(self):
+        """빨강 표시할 (tch,d,p) — 한 교사 한 교시에 수업 2개 이상."""
+        _, occ_t = self.cell_units()
+        return {k for k, uids in occ_t.items() if len(uids) > 1}
+
+    def _classes_of(self, uid, tch):
+        return [c for (c, t, s) in self.sch.units[uid].cells if t == tch]
+
+    def editor_violations(self):
+        """편집 중 실시간 경고용 하드 위반 목록 (사람이 읽는 메시지)."""
+        occ_c, occ_t = self.cell_units()
+        msgs = []
+        for (cid, d, p), uids in occ_c.items():
+            if len(uids) > 1:
+                msgs.append(f"[{cid} 수업 중복] {d}요일 {p}교시에 수업 {len(uids)}개")
+        for (tch, d, p), uids in occ_t.items():
+            if len(uids) > 1:
+                cids = []
+                for u in uids:
+                    cids.extend(self._classes_of(u, tch))
+                where = ", ".join(cids) if cids else f"{len(uids)}개"
+                msgs.append(f"[{tch} 선생님 중복] {d}요일 {p}교시 — {where} 동시")
+        bundle_day = defaultdict(set)
+        for uid, dp in enumerate(self.pos):
+            if dp is None:
+                continue
+            d, p = dp; unit = self.sch.units[uid]
+            for (cid, tch, subj) in unit.cells:
+                g = self.sch.class_grade[cid]
+                if (g, d, p) in self.sch.nonclass_set:
+                    msgs.append(f"[{cid} 비수업 위반] {d}요일 {p}교시는 비수업 시간")
+                if self.sch._unavail_blocked(tch, g, d, p):
+                    msgs.append(f"[{tch} 선생님 불가시간] {d}요일 {p}교시")
+            if unit.bundle_key:
+                if d in bundle_day[unit.bundle_key]:
+                    msgs.append(f"[묶음수업 같은 요일] {d}요일에 같은 묶음이 두 번")
+                bundle_day[unit.bundle_key].add(d)
+
+        # H5(하드): 같은 학급·같은 과목이 같은 날 cap 초과
+        csd = defaultdict(int)
+        cs_days = defaultdict(set); cs_hours = defaultdict(int)
+        for uid, dp in enumerate(self.pos):
+            if dp is None:
+                continue
+            d, p = dp
+            for (cid, tch, subj) in self.sch.units[uid].cells:
+                csd[(cid, subj, d)] += 1
+                cs_days[(cid, subj)].add(d); cs_hours[(cid, subj)] += 1
+        for (cid, subj, d), c in csd.items():
+            cap = self.sch.subj_day_cap.get((cid, subj), 1)
+            if c > cap:
+                msgs.append(f"[{cid} {subj} 같은날 몰림] {d}요일에 {c}회 (최대 {cap}회)")
+        # H11(하드): 2시간 과목이 인접한 요일에 배치
+        for (cid, subj), days in cs_days.items():
+            if cs_hours[(cid, subj)] == 2 and len(days) == 2:
+                idxs = sorted(DAY_IDX[x] for x in days)
+                if idxs[1] - idxs[0] == 1:
+                    msgs.append(f"[{cid} {subj} 연속요일] 2시간 과목이 붙은 요일({'·'.join(sorted(days, key=lambda x: DAY_IDX[x]))})에 배치")
+        # 중복 메시지 제거(순서 유지)
+        seen = set(); out = []
+        for m in msgs:
+            if m not in seen:
+                seen.add(m); out.append(m)
+        return out
+
+    def safe_slots_for(self, uid):
+        """이 수업을 옮겨도 새 하드 위반(중복·비수업·불가·묶음같은요일)이
+        생기지 않는 (요일,교시) 목록. 빈칸 기준 안전 위치."""
+        occ_c, occ_t = self.cell_units()
+        unit = self.sch.units[uid]
+        safe = []
+        for d in DAYS:
+            for p in range(1, 8):
+                ok = True
+                for (cid, tch, subj) in unit.cells:
+                    g = self.sch.class_grade[cid]
+                    if (g, d, p) in self.sch.nonclass_set: ok = False; break
+                    if self.sch._unavail_blocked(tch, g, d, p): ok = False; break
+                    if [u for u in occ_c.get((cid, d, p), []) if u != uid]: ok = False; break
+                    if [u for u in occ_t.get((tch, d, p), []) if u != uid]: ok = False; break
+                if ok and unit.bundle_key:
+                    for u2, dp2 in enumerate(self.pos):
+                        if u2 != uid and dp2 and dp2[0] == d and \
+                           self.sch.units[u2].bundle_key == unit.bundle_key:
+                            ok = False; break
+                if ok:
+                    safe.append((d, p))
+        return safe
+
+    def diagnose(self):
+        """페널티에 걸린 항목을 '누가/언제/왜'로 풀어 반환.
+        반환: {"teachers": {교사명: [사유,...]}, "classes": [사유,...], "summary": 문자열}
+        """
+        mc = self.sch.max_consecutive
+        tissues = defaultdict(list)
+
+        # 교사 연속수업 초과(H7) + 묶기(연강 없음) — 요일별 교시 패턴 분석
+        for (tch, d), ps in self.teacher_day_periods.items():
+            periods = sorted(ps)
+            if not periods:
+                continue
+            runs = []; cur = [periods[0]]
+            for i in range(1, len(periods)):
+                if periods[i] == periods[i - 1] + 1:
+                    cur.append(periods[i])
+                else:
+                    runs.append(cur); cur = [periods[i]]
+            runs.append(cur)
+            for run in runs:
+                if len(run) > mc:
+                    tissues[tch].append(
+                        f"[연속수업] {d}요일 {run[0]}~{run[-1]}교시 연속 {len(run)}시간 "
+                        f"(최대 {mc}시간 초과)")
+            if len(periods) >= 3 and not any(len(r) >= 2 for r in runs):
+                tissues[tch].append(
+                    f"[연강 없음] {d}요일 {len(periods)}시간이 모두 따로 흩어짐 "
+                    f"(붙은 수업이 하나도 없음)")
+            if self.sch.lunch_split:
+                lp = self.sch.lunch_period
+                if lp in ps and (lp + 1) in ps:
+                    tissues[tch].append(f"[점심 전후] {d}요일 {lp}·{lp+1}교시 연달아 수업")
+
+        # 교사 하루 시수 초과(S8)
+        for (tch, d), cnt in self.teacher_day.items():
+            avg = self.sch.teacher_avg_daily.get(tch, 5)
+            if cnt > avg:
+                tissues[tch].append(
+                    f"[하루 과다] {d}요일 {cnt}시간 (권장 {avg}시간보다 {cnt-avg}시간 많음)")
+
+        # 학급-과목 관련
+        cissues = []
+        for (cid, subj, d), c in self.class_subj_day.items():
+            cap = self.sch.subj_day_cap.get((cid, subj), 1)
+            if c > cap:
+                cissues.append(f"[같은 과목 같은 날] {cid} {subj} — {d}요일에 {c}번")
+        for (cid, subj), pen in self.h11_pen.items():
+            if pen > 0:
+                cissues.append(f"[2시간 과목 연속 요일] {cid} {subj}")
+        for (cid, d, grp), c in self.class_day_group.items():
+            if c > 1:
+                cissues.append(f"[유사과목 같은 날] {cid} — {d}요일")
+
+        nteach = len(tissues)
+        ntotal = sum(len(v) for v in tissues.values()) + len(cissues)
+        summary = (f"페널티에 걸린 교사 {nteach}명, 항목 {ntotal}개"
+                   if ntotal else "페널티에 걸린 교사가 없습니다. 깔끔한 시간표입니다!")
+        return {"teachers": dict(tissues), "classes": cissues, "summary": summary}
+
+    def diagnose_text(self):
+        """diagnose() 결과를 보기 좋은 여러 줄 문자열로."""
+        d = self.diagnose()
+        lines = [d["summary"]]
+        if d["teachers"]:
+            lines.append("")
+            lines.append("● 교사별 사유")
+            for tch in sorted(d["teachers"]):
+                lines.append(f"  · {tch} 선생님")
+                for r in d["teachers"][tch]:
+                    lines.append(f"      - {r}")
+        if d["classes"]:
+            lines.append("")
+            lines.append("● 학급·과목 사유")
+            for r in d["classes"]:
+                lines.append(f"  · {r}")
+        return "\n".join(lines)
+
     def get_solution(self):
         assignments = []
         for uid, unit in enumerate(self.sch.units):
@@ -264,7 +448,7 @@ class State:
             for (cid, tch, subj) in unit.cells:
                 g = self.sch.class_grade[cid]
                 if (g, d, p) in self.sch.nonclass_set: v["H4"] += 1
-                if (d, p) in self.sch.unavail_set.get(tch, _EMPTY): v["H6"] += 1
+                if self.sch._unavail_blocked(tch, g, d, p): v["H6"] += 1
         sol.violations = dict(v)
         return sol
 
@@ -304,6 +488,13 @@ class HybridScheduler:
         # 직후 교시를 한 교사가 연달아 맡을 때 벌점. lunch_period = 점심 직전 교시.
         self.lunch_split = bool(params.get("lunch_split", False))
         self.lunch_period = params.get("lunch_period", 4)
+        # 역할: 교무부장·학년부장 → 1교시 회피(가장 후순위 소프트),
+        #       홍보담당 → 4교시 이후 회피(강한 소프트)
+        self.first_avoid_teachers = set(params.get("first_avoid_teachers", []))
+        self.after3_avoid_teachers = set(params.get("after3_avoid_teachers", []))
+        # 교무부장: 2학기에는 오후(4~7교시) 수업 금지(하드)
+        self.gyomu_teachers = set(params.get("gyomu_teachers", []))
+        self.semester = int(params.get("semester", 1))
 
         self.all_classes = []
         for g, cls in data.classes_per_grade.items():
@@ -316,9 +507,11 @@ class HybridScheduler:
         self.class_grade = {cid: int(cid.split("-")[0]) for cid in self.all_classes}
 
         self.nonclass_set = set((s.grade, s.day, s.period) for s in non_class)
-        self.unavail_set = defaultdict(set)
+        # 교사 불가: tch -> {(day,period): set(grades)}  (grade 0 = 전체 학년)
+        self.unavail_set = defaultdict(dict)
         for u in unavail:
-            self.unavail_set[u.teacher].add((u.day, u.period))
+            g = getattr(u, "grade", 0) or 0
+            self.unavail_set[u.teacher].setdefault((u.day, u.period), set()).add(g)
         self.subject_to_group = {}
         for g in similar:
             for s in g.subjects:
@@ -326,7 +519,15 @@ class HybridScheduler:
 
         from excel_parser import compute_teacher_total_hours
         teacher_tot = compute_teacher_total_hours(data)
-        self.teacher_avg_daily = {t: round(tot/5) + self.daily_n for t, tot in teacher_tot.items()}
+
+        def _daily_cap(tot):
+            # 주당 시수가 5로 나누어떨어지면 여유 없이 평균에 딱 (예: 20 → 4).
+            # 그 외에는 (평균 + 여유)를 내림한다. 예: 18 → ⌊18/5 + 1⌋ = ⌊4.6⌋ = 4.
+            if tot % 5 == 0:
+                return tot // 5
+            return (tot + 5 * self.daily_n) // 5   # = floor(tot/5 + daily_n)
+
+        self.teacher_avg_daily = {t: _daily_cap(tot) for t, tot in teacher_tot.items()}
 
         self.units = []; uid = 0
         for a in data.fixed_assignments:
@@ -380,6 +581,7 @@ class HybridScheduler:
         for (cid, subj), tot in subj_total.items():
             self.subj_day_cap[(cid, subj)] = max(1, _m.ceil(tot / 5))
 
+        gyomu_pm_block = (self.semester == 2 and bool(self.gyomu_teachers))
         self.unit_candidate_slots = []
         for unit in self.units:
             cands = []
@@ -387,10 +589,122 @@ class HybridScheduler:
                 ok = True
                 for (cid, tch, subj) in unit.cells:
                     g = self.class_grade[cid]
-                    if (g, d, p) in self.nonclass_set or (d, p) in self.unavail_set.get(tch, _EMPTY):
+                    if (g, d, p) in self.nonclass_set or self._unavail_blocked(tch, g, d, p):
                         ok = False; break
+                    if gyomu_pm_block and p >= 5 and tch in self.gyomu_teachers:
+                        ok = False; break   # 2학기 교무부장 5~7교시 금지(오전 1~4교시만)
                 if ok: cands.append((d, p))
             self.unit_candidate_slots.append(cands if cands else list(self._all_slots_cache))
+
+    def _unavail_blocked(self, tch, grade, d, p):
+        """교사 tch가 (d,p)에 grade 학급 수업을 못 하는가."""
+        rule = self.unavail_set.get(tch)
+        if not rule:
+            return False
+        gs = rule.get((d, p))
+        if not gs:
+            return False
+        return (0 in gs) or (grade in gs)
+
+    def compute_unit_rigidity(self):
+        """수업(unit)별 '옮기기 어려움' 점수. 클수록 교체가 힘들다.
+        - 묶는 학급 수 / 교사 수가 많을수록 (동시에 다 비어야 하므로) 어렵다
+        - 갈 수 있는 후보 슬롯이 적을수록 어렵다
+        - 묶음수업은 '같은 묶음끼리 다른 요일' 제약까지 있어 추가 가중
+        """
+        rig = []
+        for u in range(self.n_units):
+            cells = self.units[u].cells
+            ncls = len(set(c for (c, t, s) in cells))
+            ntch = len(set(t for (c, t, s) in cells))
+            cand = max(1, len(self.unit_candidate_slots[u]))
+            # 동시에 비워야 하는 대상 수 (학급+교사) → 교체 난이도의 핵심
+            width = ncls + ntch
+            score = width * (35.0 / cand)      # 후보가 적을수록 커짐
+            if self.units[u].bundle_key:
+                score *= 1.5                   # 묶음: 요일 분산 제약까지 있어 더 경직
+            rig.append(score)
+        return rig
+
+    def compute_teacher_stress(self):
+        """교사별 가중치 = 그 교사가 맡은 수업들의 '교체 난이도' 평균.
+        옮기기 힘든 수업(특히 묶음수업)을 많이 맡은 교사일수록 큰 가중치를 받아
+        먼저·좋은 자리를 배정받는다. 1.0 ~ 3.0 배로 정규화.
+        """
+        rig = self.compute_unit_rigidity()
+        tsum = defaultdict(float); tcnt = defaultdict(int)
+        for u in range(self.n_units):
+            for t in set(t for (c, t, s) in self.units[u].cells):
+                tsum[t] += rig[u]; tcnt[t] += 1
+        if not tcnt:
+            return {}
+        avg = {t: tsum[t] / tcnt[t] for t in tcnt}
+        order = sorted(avg, key=lambda t: -avg[t])   # 어려운 순
+        n = len(order)
+        weights = {}
+        for i, t in enumerate(order):
+            weights[t] = 3.0 if n == 1 else 3.0 - 2.0 * (i / (n - 1))
+        return weights
+
+    def feasibility_report(self):
+        """해가 없을 때 학급·교사별 칸 부족을 진단한다.
+        반환: 사람이 읽는 문제 메시지 리스트 (없으면 빈 리스트)."""
+        problems = []
+        TOTAL = 35
+        nc_by_grade = defaultdict(int)
+        for (g, d, p) in self.nonclass_set:
+            nc_by_grade[g] += 1
+
+        class_hours = defaultdict(int)
+        for u in range(self.n_units):
+            for cid in set(c for (c, t, s) in self.units[u].cells):
+                class_hours[cid] += 1
+        for cid in sorted(class_hours):
+            g = self.class_grade.get(cid, 0)
+            avail = TOTAL - nc_by_grade.get(g, 0)
+            if class_hours[cid] > avail:
+                short = class_hours[cid] - avail
+                problems.append(
+                    f"[{cid}] 수업이 {class_hours[cid]}시간인데 넣을 수 있는 칸은 "
+                    f"{avail}칸뿐입니다 ({g}학년 비수업 {nc_by_grade.get(g,0)}개 제외). "
+                    f"→ {short}칸 부족. 비수업을 줄이거나 시수를 낮춰야 합니다.")
+
+        teacher_hours = defaultdict(int)
+        for u in range(self.n_units):
+            for tch in set(t for (c, t, s) in self.units[u].cells):
+                teacher_hours[tch] += 1
+        for tch in sorted(teacher_hours):
+            rule = self.unavail_set.get(tch, {})
+            ua_all = sum(1 for dp, gs in rule.items() if 0 in gs)
+            avail = TOTAL - ua_all
+            if teacher_hours[tch] > avail:
+                short = teacher_hours[tch] - avail
+                problems.append(
+                    f"[{tch} 선생님] 수업이 {teacher_hours[tch]}시간인데 가능한 칸은 "
+                    f"{avail}칸뿐입니다 (불가시간 {ua_all}개 제외). → {short}칸 부족.")
+
+        # 2학기 교무부장: 5~7교시 금지 → 오전(1~4교시) 20칸 안에 들어가야 함
+        if self.semester == 2:
+            for tch in sorted(self.gyomu_teachers):
+                h = teacher_hours.get(tch, 0)
+                rule = self.unavail_set.get(tch, {})
+                am_block = sum(1 for (d, p), gs in rule.items() if p <= 4 and 0 in gs)
+                am_avail = 20 - am_block
+                if h > am_avail:
+                    problems.append(
+                        f"[{tch} 교무부장] 2학기 5~7교시 금지인데 수업이 {h}시간입니다. "
+                        f"오전(1~4교시)에 넣을 수 있는 칸은 {am_avail}칸뿐 → {h - am_avail}칸 부족. "
+                        f"교무부장 수업을 줄이거나 오전 전용을 해제해야 합니다.")
+        return problems
+
+    def feasibility_text(self):
+        probs = self.feasibility_report()
+        if not probs:
+            return ("자동 진단으로는 명백한 칸 부족이 없습니다. "
+                    "비수업·교사불가·묶음 조건이 복합적으로 얽혀 해가 없을 수 있습니다. "
+                    "비수업이나 교사불가를 조금 줄여 다시 시도해 보세요.")
+        head = "⚠ 다음 때문에 시간표를 만들 수 없습니다 (조건이 서로 모순됩니다):"
+        return head + "\n\n" + "\n".join("• " + p for p in probs)
 
     def _bundle_legal_slots(self, state, uid):
         bkey = self.units[uid].bundle_key
@@ -573,7 +887,7 @@ class HybridScheduler:
         for (cid, tch, subj) in self.units[uid].cells:
             g = self.class_grade[cid]
             if (g, d, p) in self.nonclass_set: b += PEN_NONCLASS
-            if (d, p) in self.unavail_set.get(tch, _EMPTY): b += PEN_UNAVAIL
+            if self._unavail_blocked(tch, g, d, p): b += PEN_UNAVAIL
             if state.class_slot.get((cid, d, p), 0) > 1: b += PEN_CLASS_CONFLICT
             if state.teacher_slot.get((tch, d, p), 0) > 1: b += PEN_TEACHER_CONFLICT
             if state.class_subj_day.get((cid, subj, d), 0) > self.subj_day_cap.get((cid, subj), 1): b += PEN_SAME_DAY
@@ -639,7 +953,7 @@ class HybridScheduler:
                 if dp is None: continue
                 d, p = dp; (cid, tch, subj) = self.units[uid].cells[0]
                 g = self.class_grade[cid]
-                if (g, d, p) in self.nonclass_set or (d, p) in self.unavail_set.get(tch, _EMPTY):
+                if (g, d, p) in self.nonclass_set or self._unavail_blocked(tch, g, d, p):
                     crit.append(uid)
             return random.choice(crit) if crit else None
         v = random.choice(cands); matching = []

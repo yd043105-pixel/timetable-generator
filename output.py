@@ -113,10 +113,12 @@ def save_excel(sol, data, non_class, unavail, year, semester, params, out_dir=".
     for s in non_class:
         nc_label[(s.grade, s.day, s.period)] = s.label
 
-    # 불가시간
-    unavail_set = defaultdict(set)
+    # 불가시간: 교사 시간표의 '불가' 표시는 전체학년(grade=0) 불가일 때만.
+    # 학년별 불가는 다른 학년 수업이 그 칸에 올 수 있으므로 '불가'로 막지 않는다.
+    unavail_all = defaultdict(set)
     for u in unavail:
-        unavail_set[u.teacher].add((u.day, u.period))
+        if (getattr(u, "grade", 0) or 0) == 0:
+            unavail_all[u.teacher].add((u.day, u.period))
 
     # 특별실
     special_set = set()
@@ -224,10 +226,7 @@ def save_excel(sol, data, non_class, unavail, year, semester, params, out_dir=".
         col = 2
         for d in DAYS:
             for p in PERIODS:
-                if (d, p) in unavail_set.get(tch, set()):
-                    _set_cell(ws.cell(row=row, column=col), "불가",
-                              fill=COLOR_UNAVAIL, size=8)
-                elif (d, p) in teacher_table[tch]:
+                if (d, p) in teacher_table[tch]:
                     subj, cids, bk = teacher_table[tch][(d, p)]
                     # 분반 표시: cid 그대로 + 묶음코드 + 학급번호
                     # 예: "3-도" + 묶음 "3_S" → "3s도"
@@ -244,6 +243,9 @@ def save_excel(sol, data, non_class, unavail, year, semester, params, out_dir=".
                     fill = bundle_colors.get(bk, COLOR_BUNDLE) if bk else None
                     _set_cell(ws.cell(row=row, column=col), label, fill=fill, size=8)
                     total_hours += 1
+                elif (d, p) in unavail_all.get(tch, set()):
+                    _set_cell(ws.cell(row=row, column=col), "불가",
+                              fill=COLOR_UNAVAIL, size=8)
                 else:
                     _set_cell(ws.cell(row=row, column=col), "", size=8)
                 col += 1
@@ -313,12 +315,12 @@ def save_excel(sol, data, non_class, unavail, year, semester, params, out_dir=".
         for p in PERIODS:
             _set_cell(ws.cell(row=p + 2, column=1), str(p), bold=True, fill=COLOR_HEADER_SUB)
             for i, d in enumerate(DAYS, 2):
-                if (d, p) in unavail_set.get(tch, set()):
-                    _set_cell(ws.cell(row=p + 2, column=i), "불가", fill=COLOR_UNAVAIL)
-                elif (d, p) in teacher_table[tch]:
+                if (d, p) in teacher_table[tch]:
                     subj, cids, bk = teacher_table[tch][(d, p)]
                     fill = bundle_colors.get(bk, COLOR_BUNDLE) if bk else None
                     _set_cell(ws.cell(row=p + 2, column=i), f"{subj}\n({cids})", fill=fill)
+                elif (d, p) in unavail_all.get(tch, set()):
+                    _set_cell(ws.cell(row=p + 2, column=i), "불가", fill=COLOR_UNAVAIL)
                 else:
                     _set_cell(ws.cell(row=p + 2, column=i), "")
         for col in range(1, 7):
